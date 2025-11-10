@@ -29,6 +29,7 @@ extern SEXP nanoarrow_c_altrep_is_materialized(SEXP x_sexp);
 extern SEXP nanoarrow_c_altrep_force_materialize(SEXP x_sexp, SEXP recursive_sexp);
 extern SEXP nanoarrow_c_array_stream_get_schema(SEXP array_stream_xptr);
 extern SEXP nanoarrow_c_array_stream_get_next(SEXP array_stream_xptr);
+extern SEXP nanoarrow_c_array_stream_total_length(SEXP, SEXP);
 extern SEXP nanoarrow_c_basic_array_stream(SEXP batches_sexp, SEXP schema_xptr,
                                            SEXP validate_sexp);
 extern SEXP nanoarrow_c_array_list_total_length(SEXP list_of_array_xptr);
@@ -111,6 +112,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"nanoarrow_c_array_stream_get_schema", (DL_FUNC)&nanoarrow_c_array_stream_get_schema,
      1},
     {"nanoarrow_c_array_stream_get_next", (DL_FUNC)&nanoarrow_c_array_stream_get_next, 1},
+    {"nanoarrow_c_array_stream_total_length", (DL_FUNC)&nanoarrow_c_array_stream_total_length, 2},
     {"nanoarrow_c_basic_array_stream", (DL_FUNC)&nanoarrow_c_basic_array_stream, 3},
     {"nanoarrow_c_array_list_total_length", (DL_FUNC)&nanoarrow_c_array_list_total_length,
      1},

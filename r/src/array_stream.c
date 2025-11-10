@@ -87,6 +87,134 @@ SEXP nanoarrow_c_array_stream_get_next(SEXP array_stream_xptr) {
   return array_xptr;
 }
 
+// Calculate total size of array stream, and also return restreamed array stream.
+// Doing this all in C avoids unnecessary crossing the C and R boundary, which could
+// lead to extreme inefficiencies when large amounts of strings are involved.
+// Written entirely by ChatGPT5 Thinking, human oversight is extremely low, and there is
+// very human low confidence on PROTECT and UNPROTECT. But this does solve issue #822.
+// Returns list(size = <double>, array_stream = <nanoarrow_array_stream>)
+// array_stream_xptr: existing nanoarrow_array_stream externalptr
+// n_sexp: double scalar; if finite, limit number of batches pulled
+SEXP nanoarrow_c_array_stream_total_length(SEXP array_stream_xptr, SEXP n_sexp) {
+
+  struct ArrowArrayStream* src_stream =
+    nanoarrow_array_stream_from_xptr(array_stream_xptr);
+
+  // Optional batch limit
+  double n_real = REAL(n_sexp)[0];
+  int n_max = R_FINITE(n_real) ? (int)n_real : INT_MAX;
+
+  // ---- Get and copy schema from source stream ----
+  // (pattern matches other helpers that fetch stream schema) :contentReference[oaicite:0]{index=0}
+  SEXP schema_xptr = PROTECT(nanoarrow_schema_owning_xptr());
+  struct ArrowSchema* schema = nanoarrow_output_schema_from_xptr(schema_xptr);
+  int result = ArrowArrayStreamGetSchema(src_stream, schema, NULL);
+  if (result != NANOARROW_OK) {
+    Rf_error("ArrowArrayStream::get_schema(): %s",
+             ArrowArrayStreamGetLastError(src_stream));
+  }
+
+  // We need a copy for the new BasicArrayStream because Init() takes ownership
+  // (same approach as nanoarrow_c_basic_array_stream) :contentReference[oaicite:1]{index=1}
+  SEXP schema_copy_xptr = PROTECT(nanoarrow_schema_owning_xptr());
+  struct ArrowSchema* schema_copy = nanoarrow_output_schema_from_xptr(schema_copy_xptr);
+  schema_export(schema_xptr, schema_copy); // deep copy schema for the new stream :contentReference[oaicite:2]{index=2}
+
+  // ---- First pass (C only): pull batches, accumulate total length, stash arrays ----
+  int64_t cap = 8;
+  int64_t n_arrays = 0;
+  int64_t total_length = 0;
+
+  struct ArrowArray* arrays =
+    (struct ArrowArray*)ArrowMalloc(sizeof(struct ArrowArray) * (size_t)cap);
+  if (!arrays) {
+    UNPROTECT(2);
+    Rf_error("Out of memory allocating temporary batch list");
+  }
+
+  while (n_arrays < n_max) {
+    struct ArrowArray arr;
+    memset(&arr, 0, sizeof(arr));
+    int get_next_res = ArrowArrayStreamGetNext(src_stream, &arr, NULL);
+    if (get_next_res != NANOARROW_OK) {
+      // release any owned arrays and bail
+      for (int64_t i = 0; i < n_arrays; i++) {
+        if (arrays[i].release) arrays[i].release(&arrays[i]);
+      }
+      ArrowFree(arrays);
+      UNPROTECT(2);
+      Rf_error("ArrowArrayStream::get_next(): %s",
+               ArrowArrayStreamGetLastError(src_stream));
+    }
+    if (arr.release == NULL) break; // end-of-stream
+
+    // grow buffer if needed
+    if (n_arrays == cap) {
+      int64_t new_cap = cap * 2;
+      struct ArrowArray* arrays_new =
+        (struct ArrowArray*)ArrowRealloc(arrays, sizeof(struct ArrowArray) * (size_t)new_cap);
+      if (!arrays_new) {
+        // clean up and bail
+        arr.release(&arr);
+        for (int64_t i = 0; i < n_arrays; i++) {
+          if (arrays[i].release) arrays[i].release(&arrays[i]);
+        }
+        ArrowFree(arrays);
+        UNPROTECT(2);
+        Rf_error("Out of memory growing temporary batch list");
+      }
+      arrays = arrays_new;
+      cap = new_cap;
+    }
+
+    // Take ownership of this batch into arrays[n_arrays]
+    // ArrowBasicArrayStreamSetArray expects ownership transfer; ArrowArrayMove handles it
+    ArrowArrayMove(&arr, &arrays[n_arrays]);  // underlying helper used by BasicArrayStream :contentReference[oaicite:3]{index=3}
+    total_length += arrays[n_arrays].length;
+    n_arrays++;
+  }
+
+  // ---- Build a C-only BasicArrayStream from cached arrays ----
+  // Allocate a fresh array_stream external pointer for the output
+  SEXP out_stream_xptr = PROTECT(nanoarrow_array_stream_owning_xptr());
+  struct ArrowArrayStream* out_stream =
+    nanoarrow_output_array_stream_from_xptr(out_stream_xptr);
+
+  // Initialize BasicArrayStream; it takes ownership of schema_copy and N arrays
+  if (ArrowBasicArrayStreamInit(out_stream, schema_copy, n_arrays) != NANOARROW_OK) {
+    // on failure, release our cached arrays and free memory
+    for (int64_t i = 0; i < n_arrays; i++) {
+      if (arrays[i].release) arrays[i].release(&arrays[i]);
+    }
+    ArrowFree(arrays);
+    UNPROTECT(3); // schema_xptr, schema_copy_xptr, out_stream_xptr
+    Rf_error("Failed to initialize BasicArrayStream");
+  }
+  // Move arrays into the BasicArrayStream slots (ownership transfers) :contentReference[oaicite:4]{index=4}
+  for (int64_t i = 0; i < n_arrays; i++) {
+    ArrowBasicArrayStreamSetArray(out_stream, i, &arrays[i]); // ownership moved
+  }
+  ArrowFree(arrays);
+
+  // (Optional) Validation hook, same as nanoarrow_c_basic_array_stream
+  // ArrowBasicArrayStreamValidate(out_stream, &error) if you need checking. :contentReference[oaicite:5]{index=5}
+
+  // ---- Build return list: list(size = <double>, array_stream = <xptr>) ----
+  SEXP size_sexp = PROTECT(length_sexp_from_int64(total_length)); // helper returns REALSXP length :contentReference[oaicite:6]{index=6}
+
+  SEXP names = PROTECT(Rf_allocVector(STRSXP, 2));
+  SET_STRING_ELT(names, 0, Rf_mkChar("size"));
+  SET_STRING_ELT(names, 1, Rf_mkChar("array_stream"));
+
+  SEXP out = PROTECT(Rf_allocVector(VECSXP, 2));
+  SET_VECTOR_ELT(out, 0, size_sexp);
+  SET_VECTOR_ELT(out, 1, out_stream_xptr);
+  Rf_setAttrib(out, R_NamesSymbol, names);
+
+  UNPROTECT(6); // schema_xptr, schema_copy_xptr, out_stream_xptr, size_sexp, names, out
+  return out;
+}
+
 SEXP nanoarrow_c_basic_array_stream(SEXP batches_sexp, SEXP schema_xptr,
                                     SEXP validate_sexp) {
   int validate = LOGICAL(validate_sexp)[0];

@@ -70,33 +70,12 @@ convert_array_stream <- function(array_stream, to = NULL, size = NULL, n = Inf) 
       n
     )
   } else {
-    # Otherwise, we need to collect all batches and calculate the total length
-    # before calling nanoarrow_c_convert_array_stream().
-    batches <- collect_array_stream(
-      array_stream,
-      n,
-      schema = schema,
-      validate = FALSE
-    )
-
-    # If there is exactly one batch, use convert_array(). Converting a single
-    # array currently takes a more efficient code path for types that can be
-    # converted as ALTREP (e.g., strings).
-    if (length(batches) == 1L) {
-      return(.Call(nanoarrow_c_convert_array, batches[[1]], to))
-    }
-
-    # Otherwise, compute the final size, create another array stream,
-    # and call convert_array_stream() with a known size. Using .Call()
-    # directly because we have already type checked the inputs.
-    size <- .Call(nanoarrow_c_array_list_total_length, batches)
-    basic_stream <- .Call(nanoarrow_c_basic_array_stream, batches, schema, FALSE)
-
+    size_restreamed <- .Call(nanoarrow_c_array_stream_total_length, array_stream, n)
     .Call(
       nanoarrow_c_convert_array_stream,
-      basic_stream,
+      size_restreamed[[2]],
       to,
-      as.double(size),
+      as.double(size_restreamed[[1]]),
       Inf
     )
   }
